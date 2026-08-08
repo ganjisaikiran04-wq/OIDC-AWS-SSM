@@ -1,3 +1,4 @@
+
 name: Terraform Build and Deploy
 
 on:
@@ -167,10 +168,6 @@ jobs:
 
       # =====================================================
       # 11. GET TERRAFORM OUTPUTS
-      #
-      # IMPORTANT:
-      # There is NO bastion_public_ip because your
-      # outputs.tf does not define it.
       # =====================================================
 
       - name: Get Terraform outputs
@@ -180,7 +177,7 @@ jobs:
           set -e
 
           echo "=============================================="
-          echo "Getting Terraform outputs..."
+          echo "GETTING TERRAFORM OUTPUTS"
           echo "=============================================="
 
           PRIVATE_INSTANCE_ID=$(terraform output -raw private_instance_id)
@@ -222,8 +219,10 @@ jobs:
       - name: Display infrastructure
         shell: bash
         run: |
+          set -e
+
           echo "=============================================="
-          echo "Infrastructure"
+          echo "INFRASTRUCTURE"
           echo "=============================================="
 
           echo "Private EC2 Instance ID:"
@@ -259,7 +258,7 @@ jobs:
           INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
 
           echo "=============================================="
-          echo "Waiting for SSM agent..."
+          echo "WAITING FOR SSM AGENT"
           echo "Instance: $INSTANCE_ID"
           echo "=============================================="
 
@@ -298,7 +297,7 @@ jobs:
           INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
 
           echo "=============================================="
-          echo "Testing SSM connection..."
+          echo "TESTING SSM CONNECTION"
           echo "Instance: $INSTANCE_ID"
           echo "=============================================="
 
@@ -306,7 +305,7 @@ jobs:
             --region "$AWS_REGION" \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["hostname","python3 --version || true"]' \
+            --parameters 'commands=["hostname","python3 --version || true","curl --version || true"]' \
             --query "Command.CommandId" \
             --output text)
 
@@ -372,8 +371,18 @@ jobs:
           set -e
 
           echo "=============================================="
-          echo "Encoding application files..."
+          echo "ENCODING APPLICATION FILES"
           echo "=============================================="
+
+          if [ ! -f app.py ]; then
+            echo "ERROR: app.py not found"
+            exit 1
+          fi
+
+          if [ ! -f requirements.txt ]; then
+            echo "ERROR: requirements.txt not found"
+            exit 1
+          fi
 
           APP_B64=$(base64 -w 0 app.py)
           REQ_B64=$(base64 -w 0 requirements.txt)
@@ -403,26 +412,40 @@ jobs:
           echo "$INSTANCE_ID"
 
           DEPLOY_COMMAND=$(cat <<EOF
+          #!/bin/bash
+
           set -e
 
           echo "=========================================="
-          echo "Installing application dependencies"
+          echo "APPLICATION DEPLOYMENT STARTED"
           echo "=========================================="
 
-          # -------------------------------------------------
-          # Detect operating system
-          # -------------------------------------------------
+          echo ""
+          echo "=========================================="
+          echo "DETECTING OPERATING SYSTEM"
+          echo "=========================================="
 
           if command -v dnf >/dev/null 2>&1; then
 
               echo "Amazon Linux / DNF detected"
 
+              # IMPORTANT:
+              # Amazon Linux 2023 normally uses curl-minimal.
+              # Do NOT install the full curl package because
+              # it conflicts with curl-minimal.
+
               dnf install -y \
                 python3 \
                 python3-pip \
                 python3-devel \
-                nginx \
-                curl
+                nginx
+
+              # Verify curl is available.
+              # curl-minimal is normally already installed.
+              if ! command -v curl >/dev/null 2>&1; then
+                  echo "curl is not installed. Installing curl-minimal..."
+                  dnf install -y curl-minimal
+              fi
 
           elif command -v yum >/dev/null 2>&1; then
 
@@ -438,6 +461,8 @@ jobs:
           elif command -v apt-get >/dev/null 2>&1; then
 
               echo "Debian / Ubuntu detected"
+
+              export DEBIAN_FRONTEND=noninteractive
 
               apt-get update -y
 
@@ -457,29 +482,49 @@ jobs:
           fi
 
 
+          echo ""
+          echo "=========================================="
+          echo "VERIFYING PACKAGES"
+          echo "=========================================="
+
           echo "Python:"
           python3 --version
 
+          echo ""
           echo "Pip:"
           pip3 --version
 
+          echo ""
           echo "Nginx:"
           nginx -v
+
+          echo ""
+          echo "Curl:"
+          curl --version | head -n 1
 
 
           # -------------------------------------------------
           # Application directory
           # -------------------------------------------------
 
+          echo ""
+          echo "=========================================="
+          echo "CREATING APPLICATION DIRECTORY"
+          echo "=========================================="
+
           mkdir -p /opt/multicloud-devops
 
-          chown -R ec2-user:ec2-user \
-            /opt/multicloud-devops
+          if id ec2-user >/dev/null 2>&1; then
+              chown -R ec2-user:ec2-user /opt/multicloud-devops
+          fi
 
 
           # -------------------------------------------------
           # Write app.py
           # -------------------------------------------------
+
+          echo ""
+          echo "Writing app.py..."
 
           echo "$APP_B64" | base64 -d \
             > /opt/multicloud-devops/app.py
@@ -489,20 +534,47 @@ jobs:
           # Write requirements.txt
           # -------------------------------------------------
 
+          echo "Writing requirements.txt..."
+
           echo "$REQ_B64" | base64 -d \
             > /opt/multicloud-devops/requirements.txt
 
 
-          chown ec2-user:ec2-user \
-            /opt/multicloud-devops/app.py
+          if id ec2-user >/dev/null 2>&1; then
 
-          chown ec2-user:ec2-user \
-            /opt/multicloud-devops/requirements.txt
+              chown ec2-user:ec2-user \
+                /opt/multicloud-devops/app.py
+
+              chown ec2-user:ec2-user \
+                /opt/multicloud-devops/requirements.txt
+
+          fi
+
+
+          # -------------------------------------------------
+          # Verify application files
+          # -------------------------------------------------
+
+          echo ""
+          echo "=========================================="
+          echo "APPLICATION FILES"
+          echo "=========================================="
+
+          ls -lah /opt/multicloud-devops
+
+          echo ""
+          echo "requirements.txt:"
+          cat /opt/multicloud-devops/requirements.txt
 
 
           # -------------------------------------------------
           # Python virtual environment
           # -------------------------------------------------
+
+          echo ""
+          echo "=========================================="
+          echo "CREATING PYTHON VIRTUAL ENVIRONMENT"
+          echo "=========================================="
 
           cd /opt/multicloud-devops
 
@@ -521,6 +593,11 @@ jobs:
           # Install Flask/Gunicorn requirements
           # -------------------------------------------------
 
+          echo ""
+          echo "=========================================="
+          echo "INSTALLING PYTHON REQUIREMENTS"
+          echo "=========================================="
+
           ./venv/bin/pip \
             install -r requirements.txt
 
@@ -529,13 +606,36 @@ jobs:
           # Verify Gunicorn
           # -------------------------------------------------
 
+          echo ""
+          echo "=========================================="
+          echo "VERIFYING GUNICORN"
+          echo "=========================================="
+
           ./venv/bin/gunicorn \
             --version
 
 
           # -------------------------------------------------
+          # Verify Flask application
+          # -------------------------------------------------
+
+          echo ""
+          echo "=========================================="
+          echo "VERIFYING FLASK APPLICATION"
+          echo "=========================================="
+
+          ./venv/bin/python \
+            -c "import app; print('Flask application imported successfully')"
+
+
+          # -------------------------------------------------
           # Create systemd service
           # -------------------------------------------------
+
+          echo ""
+          echo "=========================================="
+          echo "CREATING SYSTEMD SERVICE"
+          echo "=========================================="
 
           cat > /etc/systemd/system/multicloud-devops.service <<'SERVICE'
 
@@ -544,6 +644,8 @@ jobs:
           After=network.target
 
           [Service]
+          Type=simple
+
           User=ec2-user
           Group=ec2-user
 
@@ -567,19 +669,45 @@ jobs:
           # Start Flask/Gunicorn
           # -------------------------------------------------
 
+          echo ""
+          echo "=========================================="
+          echo "STARTING GUNICORN"
+          echo "=========================================="
+
           systemctl daemon-reload
 
           systemctl enable multicloud-devops
 
           systemctl restart multicloud-devops
 
-
           sleep 5
 
 
+          echo ""
           echo "=========================================="
-          echo "Flask/Gunicorn status"
+          echo "FLASK/GUNICORN STATUS"
           echo "=========================================="
+
+          if ! systemctl is-active --quiet multicloud-devops; then
+
+              echo "Gunicorn service failed to start."
+
+              systemctl status \
+                multicloud-devops \
+                --no-pager \
+                -l || true
+
+              echo ""
+              echo "Recent journal logs:"
+
+              journalctl \
+                -u multicloud-devops \
+                -n 100 \
+                --no-pager || true
+
+              exit 1
+
+          fi
 
           systemctl status \
             multicloud-devops \
@@ -591,15 +719,25 @@ jobs:
           # Test Flask
           # -------------------------------------------------
 
-          echo "Testing Flask on port 5000..."
+          echo ""
+          echo "=========================================="
+          echo "TESTING FLASK ON PORT 5000"
+          echo "=========================================="
 
           curl -f \
+            --connect-timeout 10 \
+            --max-time 30 \
             http://127.0.0.1:5000/
 
 
           # -------------------------------------------------
           # Configure Nginx
           # -------------------------------------------------
+
+          echo ""
+          echo "=========================================="
+          echo "CONFIGURING NGINX"
+          echo "=========================================="
 
           cat > /etc/nginx/conf.d/multicloud-devops.conf <<'NGINX'
 
@@ -641,6 +779,11 @@ jobs:
           # Test Nginx
           # -------------------------------------------------
 
+          echo ""
+          echo "=========================================="
+          echo "TESTING NGINX CONFIGURATION"
+          echo "=========================================="
+
           nginx -t
 
 
@@ -648,17 +791,40 @@ jobs:
           # Start Nginx
           # -------------------------------------------------
 
+          echo ""
+          echo "=========================================="
+          echo "STARTING NGINX"
+          echo "=========================================="
+
           systemctl enable nginx
 
           systemctl restart nginx
 
-
           sleep 3
 
 
+          echo ""
           echo "=========================================="
-          echo "Nginx status"
+          echo "NGINX STATUS"
           echo "=========================================="
+
+          if ! systemctl is-active --quiet nginx; then
+
+              echo "Nginx failed to start."
+
+              systemctl status \
+                nginx \
+                --no-pager \
+                -l || true
+
+              journalctl \
+                -u nginx \
+                -n 100 \
+                --no-pager || true
+
+              exit 1
+
+          fi
 
           systemctl status \
             nginx \
@@ -670,9 +836,14 @@ jobs:
           # Test Nginx
           # -------------------------------------------------
 
-          echo "Testing Nginx on port 80..."
+          echo ""
+          echo "=========================================="
+          echo "TESTING NGINX ON PORT 80"
+          echo "=========================================="
 
           curl -f \
+            --connect-timeout 10 \
+            --max-time 30 \
             http://127.0.0.1/
 
 
@@ -689,6 +860,9 @@ jobs:
           # SEND COMMAND USING SSM
           # =================================================
 
+          echo ""
+          echo "Sending deployment command to SSM..."
+
           COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
             --instance-ids "$INSTANCE_ID" \
@@ -697,6 +871,7 @@ jobs:
               --arg command "$DEPLOY_COMMAND" \
               '{commands:[$command]}')" \
             --comment "Deploy Multi Cloud DevOps Flask application" \
+            --timeout-seconds 3600 \
             --query "Command.CommandId" \
             --output text)
 
@@ -708,16 +883,19 @@ jobs:
           # WAIT FOR DEPLOYMENT
           # =================================================
 
-          for i in {1..60}; do
+          echo ""
+          echo "Waiting for deployment..."
+
+          for i in {1..120}; do
 
             STATUS=$(aws ssm get-command-invocation \
               --region "$AWS_REGION" \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
               --query "Status" \
-              --output text)
+              --output text 2>/dev/null || true)
 
-            echo "Deployment status: $STATUS"
+            echo "Deployment attempt $i/120 - status: $STATUS"
 
             if [ "$STATUS" = "Success" ]; then
 
@@ -766,7 +944,7 @@ jobs:
 
 
       # =====================================================
-      # 17. CHECK ALB TARGET
+      # 17. CHECK ALB TARGET HEALTH
       # =====================================================
 
       - name: Check ALB target health
@@ -778,8 +956,6 @@ jobs:
           echo "CHECKING ALB TARGET HEALTH"
           echo "=============================================="
 
-          sleep 20
-
           TARGET_ARN=$(aws elbv2 describe-target-groups \
             --region "$AWS_REGION" \
             --names multicloud-devops-tg \
@@ -789,9 +965,40 @@ jobs:
           echo "Target Group:"
           echo "$TARGET_ARN"
 
+          echo ""
+
+          for i in {1..30}; do
+
+            echo "Health check attempt $i/30"
+
+            HEALTH=$(aws elbv2 describe-target-health \
+              --region "$AWS_REGION" \
+              --target-group-arn "$TARGET_ARN" \
+              --query "TargetHealthDescriptions[0].TargetHealth.State" \
+              --output text 2>/dev/null || true)
+
+            echo "Target health: $HEALTH"
+
+            if [ "$HEALTH" = "healthy" ]; then
+
+              echo ""
+              echo "ALB target is HEALTHY"
+              exit 0
+
+            fi
+
+            sleep 10
+
+          done
+
+          echo ""
+          echo "ALB target did not become healthy."
+
           aws elbv2 describe-target-health \
             --region "$AWS_REGION" \
             --target-group-arn "$TARGET_ARN"
+
+          exit 1
 
 
       # =====================================================
@@ -806,17 +1013,24 @@ jobs:
           URL="${{ steps.terraform.outputs.application_url }}"
 
           echo "=========================================="
-          echo "Application URL"
+          echo "APPLICATION URL"
           echo "=========================================="
 
           echo "$URL"
 
           echo ""
-          echo "Testing application..."
+          echo "Testing application through ALB..."
 
-          for i in {1..10}; do
+          for i in {1..20}; do
 
-            if curl -f --connect-timeout 10 "$URL"; then
+            echo ""
+            echo "Application test $i/20"
+
+            if curl \
+              -f \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "$URL"; then
 
               echo ""
               echo "=========================================="
@@ -833,7 +1047,10 @@ jobs:
 
           done
 
-          echo "ALB application test failed"
+          echo ""
+          echo "=========================================="
+          echo "ALB APPLICATION TEST FAILED"
+          echo "=========================================="
 
           exit 1
 
@@ -845,6 +1062,8 @@ jobs:
       - name: Deployment successful
         shell: bash
         run: |
+          set -e
+
           echo ""
           echo "================================================"
           echo "        DEPLOYMENT SUCCESSFUL"
@@ -885,3 +1104,4 @@ jobs:
           echo ""
 
           echo "================================================"
+
