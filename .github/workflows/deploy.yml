@@ -11,9 +11,7 @@ env:
   AWS_REGION: ap-southeast-1
 
 jobs:
-
   deploy:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -34,9 +32,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::250368537874:role/oidc
-          aws-region: ${{ env.AWS_REGION }}
-          output-env-credentials: true
-          unset-current-credentials: true
+          aws-region: ap-southeast-1
           allowed-account-ids: 250368537874
 
 
@@ -46,8 +42,17 @@ jobs:
 
       - name: Verify AWS identity
         run: |
+          echo "=============================================="
+          echo "AWS IDENTITY"
+          echo "=============================================="
+
           aws sts get-caller-identity
+
+          echo ""
+          echo "AWS Region:"
           aws configure get region
+
+          echo "=============================================="
 
 
       # =====================================================
@@ -516,10 +521,12 @@ jobs:
                   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 
                   proxy_set_header X-Forwarded-Proto \$scheme;
-
               }
+            }
 
-          }
+              
+
+          
 
           NGINX
 
@@ -590,7 +597,7 @@ jobs:
             --parameters "$(jq -n \
               --arg command "$DEPLOY_COMMAND" \
               '{commands:[$command]}')" \
-            --comment "Deploy Multi Cloud Motors Flask application" \
+            --comment "Deploy Multi Cloud DevOps Flask application" \
             --query "Command.CommandId" \
             --output text)
 
@@ -649,7 +656,6 @@ jobs:
                 --region "$AWS_REGION" \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$INSTANCE_ID"
-
 
               exit 1
 
