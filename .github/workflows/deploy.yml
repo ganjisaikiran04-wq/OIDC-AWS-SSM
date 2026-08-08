@@ -9,6 +9,7 @@ permissions:
 
 env:
   AWS_REGION: ap-southeast-1
+  AWS_DEFAULT_REGION: ap-southeast-1
 
 jobs:
   deploy:
@@ -49,8 +50,8 @@ jobs:
           echo "AWS IDENTITY"
           echo "=============================================="
 
-          echo "AWS_REGION=$AWS_REGION"
-          echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
+          echo "AWS_REGION=${AWS_REGION}"
+          echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}"
 
           echo ""
           echo "AWS CLI:"
@@ -62,7 +63,7 @@ jobs:
 
           echo ""
           echo "AWS Region:"
-          aws configure get region
+          echo "${AWS_REGION}"
 
           echo "=============================================="
 
@@ -135,17 +136,23 @@ jobs:
 
       - name: Get Terraform outputs
         id: terraform
+        shell: bash
         run: |
+          set -e
 
-          echo "private_instance_id=$(terraform output -raw private_instance_id)" >> "$GITHUB_OUTPUT"
+          echo "Getting Terraform outputs..."
 
-          echo "private_ip=$(terraform output -raw private_ec2_ip)" >> "$GITHUB_OUTPUT"
+          PRIVATE_INSTANCE_ID=$(terraform output -raw private_instance_id)
+          PRIVATE_IP=$(terraform output -raw private_ec2_ip)
+          ALB_DNS=$(terraform output -raw alb_dns_name)
+          APPLICATION_URL=$(terraform output -raw application_url)
+          BASTION_IP=$(terraform output -raw bastion_public_ip)
 
-          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
-
-          echo "application_url=$(terraform output -raw application_url)" >> "$GITHUB_OUTPUT"
-
-          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "private_instance_id=$PRIVATE_INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "private_ip=$PRIVATE_IP" >> "$GITHUB_OUTPUT"
+          echo "alb_dns=$ALB_DNS" >> "$GITHUB_OUTPUT"
+          echo "application_url=$APPLICATION_URL" >> "$GITHUB_OUTPUT"
+          echo "bastion_ip=$BASTION_IP" >> "$GITHUB_OUTPUT"
 
 
       # =====================================================
@@ -154,7 +161,6 @@ jobs:
 
       - name: Display infrastructure
         run: |
-
           echo "=============================================="
           echo "Infrastructure"
           echo "=============================================="
@@ -190,11 +196,17 @@ jobs:
       # =====================================================
 
       - name: Wait for SSM agent
+        shell: bash
         run: |
+          set -e
 
           INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
 
-          echo "Waiting for SSM agent..."
+          echo "=============================================="
+          echo "WAITING FOR SSM AGENT"
+          echo "=============================================="
+
+          echo "Instance ID: $INSTANCE_ID"
 
           for i in {1..30}; do
 
@@ -202,9 +214,9 @@ jobs:
               --region "$AWS_REGION" \
               --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
               --query "InstanceInformationList[0].PingStatus" \
-              --output text)
+              --output text 2>/dev/null || true)
 
-            echo "SSM status: $STATUS"
+            echo "Attempt $i/30 - SSM status: $STATUS"
 
             if [ "$STATUS" = "Online" ]; then
               echo "SSM agent is ONLINE"
@@ -224,11 +236,15 @@ jobs:
       # =====================================================
 
       - name: Test SSM connection
+        shell: bash
         run: |
+          set -e
 
           INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
 
-          echo "Testing SSM connection..."
+          echo "=============================================="
+          echo "TESTING SSM CONNECTION"
+          echo "=============================================="
 
           COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
@@ -249,9 +265,13 @@ jobs:
               --query "Status" \
               --output text)
 
-            echo "Command status: $STATUS"
+            echo "Attempt $i/30 - Command status: $STATUS"
 
             if [ "$STATUS" = "Success" ]; then
+
+              echo ""
+              echo "SSM command successful"
+              echo ""
 
               aws ssm get-command-invocation \
                 --region "$AWS_REGION" \
@@ -264,7 +284,11 @@ jobs:
 
             fi
 
-            if [ "$STATUS" = "Failed" ]; then
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "TimedOut" ]; then
+
+              echo "SSM command failed"
 
               aws ssm get-command-invocation \
                 --region "$AWS_REGION" \
@@ -288,17 +312,35 @@ jobs:
       # =====================================================
 
       - name: Prepare application files
+        shell: bash
         run: |
+          set -e
+
+          echo "=============================================="
+          echo "PREPARING APPLICATION"
+          echo "=============================================="
+
+          if [ ! -f "app.py" ]; then
+            echo "ERROR: app.py not found"
+            exit 1
+          fi
+
+          if [ ! -f "requirements.txt" ]; then
+            echo "ERROR: requirements.txt not found"
+            exit 1
+          fi
 
           echo "Encoding application..."
 
           APP_B64=$(base64 -w 0 app.py)
-
           REQ_B64=$(base64 -w 0 requirements.txt)
 
-          echo "APP_B64=$APP_B64" >> "$GITHUB_ENV"
+          {
+            echo "APP_B64=$APP_B64"
+            echo "REQ_B64=$REQ_B64"
+          } >> "$GITHUB_ENV"
 
-          echo "REQ_B64=$REQ_B64" >> "$GITHUB_ENV"
+          echo "Application files prepared successfully"
 
 
       # =====================================================
@@ -306,22 +348,25 @@ jobs:
       # =====================================================
 
       - name: Deploy application through SSM
+        shell: bash
         run: |
+          set -e
 
           INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
+
+          echo "=============================================="
+          echo "DEPLOY APPLICATION THROUGH SSM"
+          echo "=============================================="
 
           echo "Deploying application to:"
           echo "$INSTANCE_ID"
 
-
           DEPLOY_COMMAND=$(cat <<EOF
-
           set -e
 
           echo "=========================================="
           echo "Installing application dependencies"
           echo "=========================================="
-
 
           # -------------------------------------------------
           # Detect operating system
@@ -335,7 +380,8 @@ jobs:
                 python3 \
                 python3-pip \
                 python3-devel \
-                nginx
+                nginx \
+                curl
 
           elif command -v yum >/dev/null 2>&1; then
 
@@ -345,11 +391,14 @@ jobs:
                 python3 \
                 python3-pip \
                 python3-devel \
-                nginx
+                nginx \
+                curl
 
           elif command -v apt-get >/dev/null 2>&1; then
 
               echo "Debian / Ubuntu detected"
+
+              export DEBIAN_FRONTEND=noninteractive
 
               apt-get update -y
 
@@ -358,7 +407,8 @@ jobs:
                 python3-pip \
                 python3-venv \
                 python3-dev \
-                nginx
+                nginx \
+                curl
 
           else
 
@@ -367,6 +417,10 @@ jobs:
 
           fi
 
+
+          echo "=========================================="
+          echo "VERSIONS"
+          echo "=========================================="
 
           echo "Python:"
           python3 --version
@@ -382,15 +436,22 @@ jobs:
           # Application directory
           # -------------------------------------------------
 
+          echo "=========================================="
+          echo "APPLICATION DIRECTORY"
+          echo "=========================================="
+
           mkdir -p /opt/multicloud-devops
 
-          chown -R ec2-user:ec2-user \
-            /opt/multicloud-devops
+          if id ec2-user >/dev/null 2>&1; then
+              chown -R ec2-user:ec2-user /opt/multicloud-devops
+          fi
 
 
           # -------------------------------------------------
           # Write app.py
           # -------------------------------------------------
+
+          echo "Writing app.py..."
 
           echo "$APP_B64" | base64 -d \
             > /opt/multicloud-devops/app.py
@@ -400,20 +461,30 @@ jobs:
           # Write requirements.txt
           # -------------------------------------------------
 
+          echo "Writing requirements.txt..."
+
           echo "$REQ_B64" | base64 -d \
             > /opt/multicloud-devops/requirements.txt
 
 
-          chown ec2-user:ec2-user \
-            /opt/multicloud-devops/app.py
+          if id ec2-user >/dev/null 2>&1; then
 
-          chown ec2-user:ec2-user \
-            /opt/multicloud-devops/requirements.txt
+              chown ec2-user:ec2-user \
+                /opt/multicloud-devops/app.py
+
+              chown ec2-user:ec2-user \
+                /opt/multicloud-devops/requirements.txt
+
+          fi
 
 
           # -------------------------------------------------
           # Python virtual environment
           # -------------------------------------------------
+
+          echo "=========================================="
+          echo "PYTHON VIRTUAL ENVIRONMENT"
+          echo "=========================================="
 
           cd /opt/multicloud-devops
 
@@ -432,6 +503,8 @@ jobs:
           # Install Flask/Gunicorn requirements
           # -------------------------------------------------
 
+          echo "Installing application requirements..."
+
           ./venv/bin/pip \
             install -r requirements.txt
 
@@ -440,6 +513,10 @@ jobs:
           # Verify Gunicorn
           # -------------------------------------------------
 
+          echo "=========================================="
+          echo "GUNICORN"
+          echo "=========================================="
+
           ./venv/bin/gunicorn \
             --version
 
@@ -447,6 +524,8 @@ jobs:
           # -------------------------------------------------
           # Create systemd service
           # -------------------------------------------------
+
+          echo "Creating systemd service..."
 
           cat > /etc/systemd/system/multicloud-devops.service <<'SERVICE'
 
@@ -478,18 +557,19 @@ jobs:
           # Start Flask/Gunicorn
           # -------------------------------------------------
 
+          echo "Starting Flask/Gunicorn..."
+
           systemctl daemon-reload
 
           systemctl enable multicloud-devops
 
           systemctl restart multicloud-devops
 
-
           sleep 5
 
 
           echo "=========================================="
-          echo "Flask/Gunicorn status"
+          echo "FLASK/GUNICORN STATUS"
           echo "=========================================="
 
           systemctl status \
@@ -502,7 +582,9 @@ jobs:
           # Test Flask
           # -------------------------------------------------
 
-          echo "Testing Flask on port 5000..."
+          echo "=========================================="
+          echo "TESTING FLASK"
+          echo "=========================================="
 
           curl -f \
             http://127.0.0.1:5000/
@@ -512,14 +594,20 @@ jobs:
           # Configure Nginx
           # -------------------------------------------------
 
+          echo "=========================================="
+          echo "CONFIGURING NGINX"
+          echo "=========================================="
+
           cat > /etc/nginx/conf.d/multicloud-devops.conf <<'NGINX'
 
           server {
               listen 80;
+
               server_name _;
 
               location / {
                   proxy_pass http://127.0.0.1:5000;
+
                   proxy_http_version 1.1;
 
                   proxy_set_header Host \$host;
@@ -543,6 +631,8 @@ jobs:
           # Test Nginx
           # -------------------------------------------------
 
+          echo "Testing Nginx configuration..."
+
           nginx -t
 
 
@@ -550,16 +640,17 @@ jobs:
           # Start Nginx
           # -------------------------------------------------
 
+          echo "Starting Nginx..."
+
           systemctl enable nginx
 
           systemctl restart nginx
-
 
           sleep 3
 
 
           echo "=========================================="
-          echo "Nginx status"
+          echo "NGINX STATUS"
           echo "=========================================="
 
           systemctl status \
@@ -572,7 +663,9 @@ jobs:
           # Test Nginx
           # -------------------------------------------------
 
-          echo "Testing Nginx on port 80..."
+          echo "=========================================="
+          echo "TESTING NGINX"
+          echo "=========================================="
 
           curl -f \
             http://127.0.0.1/
@@ -583,7 +676,6 @@ jobs:
           echo "APPLICATION DEPLOYED SUCCESSFULLY"
           echo "=========================================="
 
-
           EOF
           )
 
@@ -591,6 +683,8 @@ jobs:
           # =================================================
           # SEND COMMAND USING SSM
           # =================================================
+
+          echo "Sending deployment command through SSM..."
 
           COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
@@ -603,7 +697,6 @@ jobs:
             --query "Command.CommandId" \
             --output text)
 
-
           echo "SSM Command ID:"
           echo "$COMMAND_ID"
 
@@ -611,6 +704,8 @@ jobs:
           # =================================================
           # WAIT FOR DEPLOYMENT
           # =================================================
+
+          echo "Waiting for deployment..."
 
           for i in {1..60}; do
 
@@ -621,7 +716,7 @@ jobs:
               --query "Status" \
               --output text)
 
-            echo "Deployment status: $STATUS"
+            echo "Attempt $i/60 - Deployment status: $STATUS"
 
 
             if [ "$STATUS" = "Success" ]; then
@@ -630,7 +725,6 @@ jobs:
               echo "=========================================="
               echo "SSM DEPLOYMENT SUCCESS"
               echo "=========================================="
-
 
               aws ssm get-command-invocation \
                 --region "$AWS_REGION" \
@@ -652,7 +746,6 @@ jobs:
               echo "=========================================="
               echo "SSM DEPLOYMENT FAILED"
               echo "=========================================="
-
 
               aws ssm get-command-invocation \
                 --region "$AWS_REGION" \
@@ -678,7 +771,12 @@ jobs:
       # =====================================================
 
       - name: Check ALB target health
+        shell: bash
         run: |
+
+          echo "=============================================="
+          echo "ALB TARGET HEALTH"
+          echo "=============================================="
 
           echo "Waiting for ALB target health..."
 
@@ -706,16 +804,18 @@ jobs:
       # =====================================================
 
       - name: Test application through ALB
+        shell: bash
         run: |
+
+          set -e
 
           URL="${{ steps.terraform.outputs.application_url }}"
 
           echo "=========================================="
-          echo "Application URL"
+          echo "APPLICATION URL"
           echo "=========================================="
 
           echo "$URL"
-
 
           echo ""
           echo "Testing application..."
@@ -723,7 +823,10 @@ jobs:
 
           for i in {1..10}; do
 
-            if curl -f --connect-timeout 10 "$URL"; then
+            if curl -f \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "$URL"; then
 
               echo ""
               echo "=========================================="
@@ -760,6 +863,20 @@ jobs:
 
           echo ""
 
+          echo "AWS Account:"
+          aws sts get-caller-identity \
+            --query "Account" \
+            --output text
+
+          echo ""
+
+          echo "AWS Role:"
+          aws sts get-caller-identity \
+            --query "Arn" \
+            --output text
+
+          echo ""
+
           echo "AWS Region:"
           echo "${AWS_REGION}"
 
@@ -775,6 +892,11 @@ jobs:
 
           echo ""
 
+          echo "Bastion IP:"
+          echo "${{ steps.terraform.outputs.bastion_ip }}"
+
+          echo ""
+
           echo "ALB:"
           echo "${{ steps.terraform.outputs.alb_dns }}"
 
@@ -787,6 +909,7 @@ jobs:
 
           echo "Architecture:"
           echo "GitHub OIDC -> AWS -> SSM -> Private EC2"
+
           echo "User -> ALB -> Nginx -> Gunicorn -> Flask"
 
           echo ""
