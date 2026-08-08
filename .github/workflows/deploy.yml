@@ -28,36 +28,14 @@ jobs:
       # 2. GITHUB OIDC -> AWS
       # =====================================================
 
-      - name: Verify AWS identity
-        run: |
-         set -x
-
-         echo "=============================================="
-         echo "AWS IDENTITY"
-         echo "=============================================="
-
-         echo "AWS_REGION=$AWS_REGION"
-         echo "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION"
-
-         echo ""
-         echo "AWS CLI:"
-         aws --version
-
-         echo ""
-         echo "AWS Identity:"
-         aws sts get-caller-identity
-
-         echo ""
-         echo "Testing EC2 access:"
-         aws ec2 describe-regions \
-         --region "$AWS_REGION" \
-         --query "Regions[0].RegionName" \
-         --output text
-
-         echo ""
-         echo "AWS authentication test PASSED"
-         echo "=============================================="
-
+      - name: Configure AWS credentials
+        id: aws
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::250368537874:role/oidc
+          aws-region: ap-southeast-1
+          allowed-account-ids: 250368537874
+          output-env-credentials: true
 
       # =====================================================
       # 3. VERIFY AWS
@@ -65,17 +43,17 @@ jobs:
 
       - name: Verify AWS identity
         run: |
-          echo "=============================================="
-          echo "AWS IDENTITY"
-          echo "=============================================="
+         echo "=============================================="
+         echo "AWS IDENTITY"
+         echo "=============================================="
 
-          aws sts get-caller-identity
+         aws sts get-caller-identity
 
-          echo ""
-          echo "AWS Region:"
-          aws configure get region
+         echo ""
+         echo "AWS Region:"
+         aws configure get region
 
-          echo "=============================================="
+         echo "=============================================="
 
 
       # =====================================================
