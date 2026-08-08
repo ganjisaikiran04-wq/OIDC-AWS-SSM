@@ -2,11 +2,6 @@ output "vpc_id" {
   value = aws_vpc.main.id
 }
 
-output "bastion_public_ip" {
-  description = "Public IP of bastion host"
-  value       = aws_instance.bastion.public_ip
-}
-
 output "private_instance_id" {
   description = "Private application EC2 instance ID"
 
