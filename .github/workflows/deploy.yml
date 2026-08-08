@@ -28,13 +28,10 @@ jobs:
       # 2. GITHUB OIDC -> AWS
       # =====================================================
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: arn:aws:iam::250368537874:role/oidc
-          aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: 250368537874
-
+      - name: Verify AWS identity
+        run: |
+         aws sts get-caller-identity
+         echo "AWS Region: $AWS_REGION"
 
       # =====================================================
       # 3. VERIFY AWS
