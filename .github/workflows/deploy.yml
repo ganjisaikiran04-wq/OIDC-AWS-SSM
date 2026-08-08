@@ -1,0 +1,784 @@
+name: Terraform Build and Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+
+jobs:
+
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # =====================================================
+      # 1. CHECKOUT
+      # =====================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # =====================================================
+      # 2. GITHUB OIDC -> AWS
+      # =====================================================
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::250368537874:role/oidc
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # =====================================================
+      # 3. VERIFY AWS
+      # =====================================================
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+          aws configure get region
+
+
+      # =====================================================
+      # 4. SETUP TERRAFORM
+      # =====================================================
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+
+      # =====================================================
+      # 5. TERRAFORM FORMAT
+      # =====================================================
+
+      - name: Terraform Format
+        run: |
+          terraform fmt -recursive
+
+
+      # =====================================================
+      # 6. TERRAFORM INIT
+      # =====================================================
+
+      - name: Terraform Init
+        run: |
+          terraform init
+
+
+      # =====================================================
+      # 7. TERRAFORM VALIDATE
+      # =====================================================
+
+      - name: Terraform Validate
+        run: |
+          terraform validate
+
+
+      # =====================================================
+      # 8. TERRAFORM PLAN
+      # =====================================================
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var="aws_region=${AWS_REGION}" \
+            -var="ami_id=${{ secrets.AMI_ID }}" \
+            -var="key_name=aps" \
+            -var="instance_type=t3.micro"
+
+
+      # =====================================================
+      # 9. TERRAFORM APPLY
+      # =====================================================
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            -var="aws_region=${AWS_REGION}" \
+            -var="ami_id=${{ secrets.AMI_ID }}" \
+            -var="key_name=aps" \
+            -var="instance_type=t3.micro"
+
+
+      # =====================================================
+      # 10. GET TERRAFORM OUTPUTS
+      # =====================================================
+
+      - name: Get Terraform outputs
+        id: terraform
+        run: |
+
+          echo "private_instance_id=$(terraform output -raw private_instance_id)" >> "$GITHUB_OUTPUT"
+
+          echo "private_ip=$(terraform output -raw private_ec2_ip)" >> "$GITHUB_OUTPUT"
+
+          echo "alb_dns=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+
+          echo "application_url=$(terraform output -raw application_url)" >> "$GITHUB_OUTPUT"
+
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> "$GITHUB_OUTPUT"
+
+
+      # =====================================================
+      # 11. DISPLAY INFRASTRUCTURE
+      # =====================================================
+
+      - name: Display infrastructure
+        run: |
+
+          echo "=============================================="
+          echo "Infrastructure"
+          echo "=============================================="
+
+          echo "Private EC2 Instance ID:"
+          echo "${{ steps.terraform.outputs.private_instance_id }}"
+
+          echo ""
+
+          echo "Private EC2 IP:"
+          echo "${{ steps.terraform.outputs.private_ip }}"
+
+          echo ""
+
+          echo "Bastion IP:"
+          echo "${{ steps.terraform.outputs.bastion_ip }}"
+
+          echo ""
+
+          echo "ALB DNS:"
+          echo "${{ steps.terraform.outputs.alb_dns }}"
+
+          echo ""
+
+          echo "Application URL:"
+          echo "${{ steps.terraform.outputs.application_url }}"
+
+          echo "=============================================="
+
+
+      # =====================================================
+      # 12. WAIT FOR SSM AGENT
+      # =====================================================
+
+      - name: Wait for SSM agent
+        run: |
+
+          INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
+
+          echo "Waiting for SSM agent..."
+
+          for i in {1..30}; do
+
+            STATUS=$(aws ssm describe-instance-information \
+              --region "$AWS_REGION" \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text)
+
+            echo "SSM status: $STATUS"
+
+            if [ "$STATUS" = "Online" ]; then
+              echo "SSM agent is ONLINE"
+              exit 0
+            fi
+
+            sleep 10
+
+          done
+
+          echo "SSM agent did not become online"
+          exit 1
+
+
+      # =====================================================
+      # 13. TEST SSM CONNECTION
+      # =====================================================
+
+      - name: Test SSM connection
+        run: |
+
+          INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
+
+          echo "Testing SSM connection..."
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["hostname","python3 --version || true"]' \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Command ID: $COMMAND_ID"
+
+          for i in {1..30}; do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "Command status: $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardOutputContent" \
+                --output text
+
+              exit 0
+
+            fi
+
+            if [ "$STATUS" = "Failed" ]; then
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID"
+
+              exit 1
+
+            fi
+
+            sleep 5
+
+          done
+
+          echo "SSM command timeout"
+          exit 1
+
+
+      # =====================================================
+      # 14. PREPARE APPLICATION FILES
+      # =====================================================
+
+      - name: Prepare application files
+        run: |
+
+          echo "Encoding application..."
+
+          APP_B64=$(base64 -w 0 app.py)
+
+          REQ_B64=$(base64 -w 0 requirements.txt)
+
+          echo "APP_B64=$APP_B64" >> "$GITHUB_ENV"
+
+          echo "REQ_B64=$REQ_B64" >> "$GITHUB_ENV"
+
+
+      # =====================================================
+      # 15. DEPLOY APPLICATION THROUGH SSM
+      # =====================================================
+
+      - name: Deploy application through SSM
+        run: |
+
+          INSTANCE_ID="${{ steps.terraform.outputs.private_instance_id }}"
+
+          echo "Deploying application to:"
+          echo "$INSTANCE_ID"
+
+
+          DEPLOY_COMMAND=$(cat <<EOF
+
+          set -e
+
+          echo "=========================================="
+          echo "Installing application dependencies"
+          echo "=========================================="
+
+
+          # -------------------------------------------------
+          # Detect operating system
+          # -------------------------------------------------
+
+          if command -v dnf >/dev/null 2>&1; then
+
+              echo "Amazon Linux / DNF detected"
+
+              dnf install -y \
+                python3 \
+                python3-pip \
+                python3-devel \
+                nginx
+
+          elif command -v yum >/dev/null 2>&1; then
+
+              echo "YUM detected"
+
+              yum install -y \
+                python3 \
+                python3-pip \
+                python3-devel \
+                nginx
+
+          elif command -v apt-get >/dev/null 2>&1; then
+
+              echo "Debian / Ubuntu detected"
+
+              apt-get update -y
+
+              apt-get install -y \
+                python3 \
+                python3-pip \
+                python3-venv \
+                python3-dev \
+                nginx
+
+          else
+
+              echo "Unsupported operating system"
+              exit 1
+
+          fi
+
+
+          echo "Python:"
+          python3 --version
+
+          echo "Pip:"
+          pip3 --version
+
+          echo "Nginx:"
+          nginx -v
+
+
+          # -------------------------------------------------
+          # Application directory
+          # -------------------------------------------------
+
+          mkdir -p /opt/multicloud-devops
+
+          chown -R ec2-user:ec2-user \
+            /opt/multicloud-devops
+
+
+          # -------------------------------------------------
+          # Write app.py
+          # -------------------------------------------------
+
+          echo "$APP_B64" | base64 -d \
+            > /opt/multicloud-devops/app.py
+
+
+          # -------------------------------------------------
+          # Write requirements.txt
+          # -------------------------------------------------
+
+          echo "$REQ_B64" | base64 -d \
+            > /opt/multicloud-devops/requirements.txt
+
+
+          chown ec2-user:ec2-user \
+            /opt/multicloud-devops/app.py
+
+          chown ec2-user:ec2-user \
+            /opt/multicloud-devops/requirements.txt
+
+
+          # -------------------------------------------------
+          # Python virtual environment
+          # -------------------------------------------------
+
+          cd /opt/multicloud-devops
+
+          if [ ! -d "venv" ]; then
+
+              python3 -m venv venv
+
+          fi
+
+
+          ./venv/bin/python \
+            -m pip install --upgrade pip
+
+
+          # -------------------------------------------------
+          # Install Flask/Gunicorn requirements
+          # -------------------------------------------------
+
+          ./venv/bin/pip \
+            install -r requirements.txt
+
+
+          # -------------------------------------------------
+          # Verify Gunicorn
+          # -------------------------------------------------
+
+          ./venv/bin/gunicorn \
+            --version
+
+
+          # -------------------------------------------------
+          # Create systemd service
+          # -------------------------------------------------
+
+          cat > /etc/systemd/system/multicloud-devops.service <<'SERVICE'
+
+          [Unit]
+          Description=Multi Cloud DevOps Flask Application
+          After=network.target
+
+          [Service]
+          User=ec2-user
+          Group=ec2-user
+
+          WorkingDirectory=/opt/multicloud-devops
+
+          Environment="PYTHONUNBUFFERED=1"
+          Environment="PATH=/opt/multicloud-devops/venv/bin"
+
+          ExecStart=/opt/multicloud-devops/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 app:app
+
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+          SERVICE
+
+
+          # -------------------------------------------------
+          # Start Flask/Gunicorn
+          # -------------------------------------------------
+
+          systemctl daemon-reload
+
+          systemctl enable multicloud-devops
+
+          systemctl restart multicloud-devops
+
+
+          sleep 5
+
+
+          echo "=========================================="
+          echo "Flask/Gunicorn status"
+          echo "=========================================="
+
+          systemctl status \
+            multicloud-devops \
+            --no-pager \
+            -l
+
+
+          # -------------------------------------------------
+          # Test Flask
+          # -------------------------------------------------
+
+          echo "Testing Flask on port 5000..."
+
+          curl -f \
+            http://127.0.0.1:5000/
+
+
+          # -------------------------------------------------
+          # Configure Nginx
+          # -------------------------------------------------
+
+          cat > /etc/nginx/conf.d/multicloud-devops.conf <<'NGINX'
+
+          server {
+
+              listen 80;
+
+              server_name _;
+
+              location / {
+
+                  proxy_pass http://127.0.0.1:5000;
+
+                  proxy_http_version 1.1;
+
+                  proxy_set_header Host \$host;
+
+                  proxy_set_header X-Real-IP \$remote_addr;
+
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+
+              }
+
+          }
+
+          NGINX
+
+
+          # -------------------------------------------------
+          # Remove default Nginx config
+          # -------------------------------------------------
+
+          rm -f /etc/nginx/conf.d/default.conf
+
+
+          # -------------------------------------------------
+          # Test Nginx
+          # -------------------------------------------------
+
+          nginx -t
+
+
+          # -------------------------------------------------
+          # Start Nginx
+          # -------------------------------------------------
+
+          systemctl enable nginx
+
+          systemctl restart nginx
+
+
+          sleep 3
+
+
+          echo "=========================================="
+          echo "Nginx status"
+          echo "=========================================="
+
+          systemctl status \
+            nginx \
+            --no-pager \
+            -l
+
+
+          # -------------------------------------------------
+          # Test Nginx
+          # -------------------------------------------------
+
+          echo "Testing Nginx on port 80..."
+
+          curl -f \
+            http://127.0.0.1/
+
+
+          echo ""
+          echo "=========================================="
+          echo "APPLICATION DEPLOYED SUCCESSFULLY"
+          echo "=========================================="
+
+          EOF
+          )
+
+
+          # =================================================
+          # SEND COMMAND USING SSM
+          # =================================================
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "$(jq -n \
+              --arg command "$DEPLOY_COMMAND" \
+              '{commands:[$command]}')" \
+            --comment "Deploy Multi Cloud Motors Flask application" \
+            --query "Command.CommandId" \
+            --output text)
+
+
+          echo "SSM Command ID:"
+          echo "$COMMAND_ID"
+
+
+          # =================================================
+          # WAIT FOR DEPLOYMENT
+          # =================================================
+
+          for i in {1..60}; do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "Deployment status: $STATUS"
+
+
+            if [ "$STATUS" = "Success" ]; then
+
+              echo ""
+              echo "=========================================="
+              echo "SSM DEPLOYMENT SUCCESS"
+              echo "=========================================="
+
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardOutputContent" \
+                --output text
+
+              exit 0
+
+            fi
+
+
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "TimedOut" ]; then
+
+              echo ""
+              echo "=========================================="
+              echo "SSM DEPLOYMENT FAILED"
+              echo "=========================================="
+
+
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID"
+
+
+              exit 1
+
+            fi
+
+            sleep 5
+
+          done
+
+
+          echo "Deployment timed out"
+
+          exit 1
+
+
+      # =====================================================
+      # 16. CHECK ALB TARGET
+      # =====================================================
+
+      - name: Check ALB target health
+        run: |
+
+          echo "Waiting for ALB target health..."
+
+          sleep 20
+
+
+          TARGET_ARN=$(aws elbv2 describe-target-groups \
+            --region "$AWS_REGION" \
+            --names multicloud-devops-tg \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
+
+
+          echo "Target Group:"
+          echo "$TARGET_ARN"
+
+
+          aws elbv2 describe-target-health \
+            --region "$AWS_REGION" \
+            --target-group-arn "$TARGET_ARN"
+
+
+      # =====================================================
+      # 17. TEST APPLICATION THROUGH ALB
+      # =====================================================
+
+      - name: Test application through ALB
+        run: |
+
+          URL="${{ steps.terraform.outputs.application_url }}"
+
+          echo "=========================================="
+          echo "Application URL"
+          echo "=========================================="
+
+          echo "$URL"
+
+
+          echo ""
+          echo "Testing application..."
+
+
+          for i in {1..10}; do
+
+            if curl -f --connect-timeout 10 "$URL"; then
+
+              echo ""
+              echo "=========================================="
+              echo "APPLICATION IS LIVE"
+              echo "=========================================="
+
+              exit 0
+
+            fi
+
+            echo "Application not ready yet..."
+
+            sleep 10
+
+          done
+
+
+          echo "ALB application test failed"
+
+          exit 1
+
+
+      # =====================================================
+      # 18. FINAL OUTPUT
+      # =====================================================
+
+      - name: Deployment successful
+        run: |
+
+          echo ""
+          echo "================================================"
+          echo "        DEPLOYMENT SUCCESSFUL"
+          echo "================================================"
+
+          echo ""
+
+          echo "AWS Region:"
+          echo "${AWS_REGION}"
+
+          echo ""
+
+          echo "Private EC2:"
+          echo "${{ steps.terraform.outputs.private_ip }}"
+
+          echo ""
+
+          echo "SSM Instance ID:"
+          echo "${{ steps.terraform.outputs.private_instance_id }}"
+
+          echo ""
+
+          echo "ALB:"
+          echo "${{ steps.terraform.outputs.alb_dns }}"
+
+          echo ""
+
+          echo "Application:"
+          echo "${{ steps.terraform.outputs.application_url }}"
+
+          echo ""
+
+          echo "Architecture:"
+          echo "GitHub OIDC -> AWS -> SSM -> Private EC2"
+
+          echo "User -> ALB -> Nginx -> Gunicorn -> Flask"
+
+          echo ""
+
+          echo "================================================"
